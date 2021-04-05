@@ -1,0 +1,163 @@
+---
+title: "Demo 2 | Working with Vector Data"
+subtitle: "DevSummit 2021 | Harnessing the Power of R in ArcGIS with R-ArcGIS Bridge"
+author: Jie Liu
+output: html_notebook
+---
+
+```{r}
+library(arcgisbinding)
+arc.check_product()
+
+if(!requireNamespace("spThin", quietly = TRUE))
+    install.packages("spThin", quiet = TRUE)
+if(!requireNamespace("ggplot2", quietly = TRUE))
+    install.packages("ggplot2", quiet = TRUE)
+if(!requireNamespace("sf", quietly = TRUE))
+    install.packages("sf", quiet = TRUE)
+# !diagnostics off
+```
+
+```{r}
+# set work directory to ArcGIS Project
+projectFolder <- "C:\\demo\\DevSummit2021-RNotebook"
+setwd(projectFolder)
+```
+
+```{r}
+#############################################
+# Read in data with arc.open and arc.select #
+#############################################
+# data source: https://www.gbif.org/
+presencePoints <- "JoshuaTree_Desert_Turtles.shp"
+
+# read in data using arc.open
+arc.data0 <- arc.open(presencePoints)
+data <- arc.select(arc.data0)
+
+# list available fields and type
+arc.data0@fields
+
+# check dataframe
+head(data)
+```
+
+```{r}
+# check DateTime field range
+min(data$eventDateT, na.rm = TRUE)
+```
+```{r}
+# More options with arc.select: fields, where_clause, sr
+
+# only fields of interests
+latField <- "decimalLat"
+longField <- "decimalLon"
+speciesField <- "scientific"
+selected_fields <- c("FID", "eventDateT", longField, latField, speciesField)
+
+# only data from 2000 to 2020
+filter <- "eventDateT >= timestamp '2000-01-01 00:00:00'"
+
+# read in as R dataframe
+data0 <- arc.select(arc.data0, fields = selected_fields, where_clause = filter)
+
+# quick check the new data frame
+max(data0$eventDateT)
+min(data0$eventDateT)
+head(data0)
+```
+
+```{r}
+###################################
+# Visualize the data with ggplots #
+###################################
+library(ggplot2)
+# use arc.data2sf to convert to a simple feature (sf) object
+data0.sf <- arc.data2sf(data0)
+
+# visualize using geom_sf in ggplot2
+p1 <- ggplot() + geom_sf(data = data0.sf, colour = "orange")
+p1
+```
+
+```{r}
+#########################
+# Spatial Thin the data #
+#########################
+# Goal: create a largest subset of the data that nearest neighbor distance more than 5km
+
+library(spThin)
+
+# Set parameters
+neighborDistance <- 15 #unit = km
+iterations <- 10
+csvPrefix <- paste("JoshuaTree_Desert_Turtles_spThin", neighborDistance, "km", sep= "_")
+csvPrefix
+logFile <- paste0(csvPrefix, ".txt")
+
+# Run the model for 30 iterations, and write the result with maximum points left as csv files
+thin_model <- thin( loc.data = data0, 
+                    lat.col = latField, 
+                    long.col = longField, 
+                    spec.col = speciesField,
+                    thin.par = neighborDistance, 
+                    reps = iterations, 
+                    locs.thinned.list.return = TRUE, 
+                    write.files = TRUE, 
+                    max.files = 3, 
+                    out.dir = projectFolder, 
+                    out.base = csvPrefix, 
+                    write.log.file = TRUE,
+                    log.file = logFile )
+
+# Create summaryplots 
+plotThin( thin_model )
+```
+
+```{r}
+##################################################
+# Create subset sf object of only thinned points #
+##################################################
+
+# Import the csv with most thin points
+thinData <- read.csv(file = paste0(csvPrefix, '_thin1.csv'))
+head(thinData)
+nrow(thinData)
+
+# Inner join with original data
+mergedData <- merge(x = thinData, y = data0.sf, by = c(longField, latField), all = FALSE)
+head(mergedData)
+nrow(mergedData)
+
+# Remove duplicates: multiple occurence at the exactly same location
+duplicates <- duplicated(mergedData$decimalLon)
+mergedData <- mergedData[!duplicates, ]
+
+# Get FIDs of thinned data
+thinID <- mergedData$FID
+
+# Add new column ThinSelected in original data, 1 = left after spatial thinning, 0 = removed
+data0.sf$ThinSelected <- 0
+for(OID in thinID){
+    data0.sf$ThinSelected[(data0.sf$FID == OID)] <- 1
+}
+table(data0.sf$ThinSelected)
+
+# Visualize
+p2 <- ggplot() + geom_sf(data = data0.sf, aes(colour = ThinSelected))
+p2
+
+# Subset with ThinSelected == 1
+data0.sf.thin <- data0.sf[data0.sf$ThinSelected == 1,]
+table(data0.sf.thin$ThinSelected)
+```
+
+```{r}
+#############################################
+# Write output feature class with arc.write #
+#############################################
+
+out_fc <- paste0("DevSummit2021-RNotebook.gdb/", csvPrefix)
+arc.write(out_fc, data0.sf.thin, overwrite = TRUE)
+out_fc
+```

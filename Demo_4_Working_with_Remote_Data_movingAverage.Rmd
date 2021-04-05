@@ -1,0 +1,224 @@
+---
+title: "Demo 4 | Working with Remote Data"
+subtitle: "DevSummit 2021 | Harnessing the Power of R in ArcGIS with R-ArcGIS Bridge"
+author: Jie Liu
+output: html_notebook
+abstract: |
+  1. Use R-bridge to read remote data: COVID-19 (feature service) from JHU Dashboard
+  2. Clean data: add time field, remove out of state and unassigned cases
+  3. Analysis: calcualte 7-day average of new cases and new death
+  4. Use R-bridge to write out feature class to Pro and create charts in Pro
+  
+  Data source: <a href="https://coronavirus-resources.esri.com/datasets/4cb598ae041348fb92270f102a6783cb?showData=true">JHU Centers for Civic Impact Covid-19 County Cases (Daily Update)</a> on esri COVID-19 GIS Hub, including:
+  <br></br><a href="https://coronavirus-resources.esri.com/datasets/4cb598ae041348fb92270f102a6783cb_1">USCounties time</a>: table of the daily COVID-19 time-series data
+  <br></br><a href="https://coronavirus-resources.esri.com/datasets/4cb598ae041348fb92270f102a6783cb_0">USCounties cases</a>: features containing the up-to-date case number and county-level sociodemographic info
+---
+
+```{r}
+library(arcgisbinding)
+arc.check_product()
+
+if(!requireNamespace("zoo", quietly = TRUE))
+    install.packages("zoo", quiet = TRUE)
+if(!requireNamespace("sf", quietly = TRUE))
+    install.packages("sf", quiet = TRUE)
+if(!requireNamespace("data.table", quietly = TRUE))
+    install.packages("data.table", quiet = TRUE)
+
+require(zoo, quietly = TRUE)
+require(sf, quietly = TRUE)
+require(data.table, quietly = TRUE)
+# !diagnostics off
+```
+
+```{r}
+# set work directory to ArcGIS Folder
+projectFolder <- "C:\\demo\\DevSummit2021-RNotebook"
+setwd(projectFolder)
+```
+
+```{r}
+#############################################
+# Read in data with arc.open and arc.select #
+#############################################
+
+# Select data for California
+state <- "California"
+stateFIP <- "06"
+
+selection <- paste0("ST_NAME = '", state, "'")
+selection_stateFIP <- paste0("STATEFP = '", stateFIP, "'")
+
+selection
+selection_stateFIP
+```
+
+```{r}
+# Read up-to-date COVID-19 cases and death TABLE from JHU Dashboard
+arc.data1 <- arc.open('https://services9.arcgis.com/6Hv9AANartyT7fJW/arcgis/rest/services/USCounties_cases_V1/FeatureServer/1') #fill in the URL of feature service
+arc.data1@dataset_type
+arc.data1@fields
+
+COVID19_time <- arc.select(arc.data1, where_clause = selection)
+
+head(COVID19_time)
+```
+
+```{r}
+# Read US counties feature service from JHU Dashboard as well, including sociodemographic data
+
+# Select California Counties with Valid Geometry
+selection_valid_area = paste0(selection, ' AND Shape__Area > 0')
+selection_valid_area
+
+arc.data0 <- arc.open('https://services9.arcgis.com/6Hv9AANartyT7fJW/arcgis/rest/services/USCounties_cases_V1/FeatureServer/0')
+USCounties <- arc.select(arc.data0, fields = c("FIPS"), 
+                         where_clause = selection_valid_area, sr = 3857)
+
+tail(USCounties)
+```
+```{r}
+#################
+# Data Cleaning #
+#################
+# Define Date Column
+COVID19_time$date <- as.Date(COVID19_time$dt)
+firstDate <- min(COVID19_time$date)
+firstDate
+lastDate <- max(COVID19_time$date)
+lastDate
+
+# Check counties and remove "Out of XX" and "Unassigned"
+counties <- unique(COVID19_time$Countyname)
+counties
+
+# Get the "Out of state's name"
+DT <- data.table(allCounties=counties)
+outof <- DT[allCounties %like% "^Out of"]
+outofTheState <- outof$allCounties
+outofTheState
+
+# Remove "Out of XX" and "Unassigned"
+counties <- counties[!counties %in% c(outofTheState, "Unassigned")]
+COVID19_time <- COVID19_time[ which(COVID19_time$Countyname %in% counties), ]
+tail(COVID19_time)
+```
+
+```{r}
+########################################################################
+# Analysis: Calculate Moving Average of Daily New Cases and New Deaths #
+########################################################################
+# Reference: https://www.storybench.org/how-to-calculate-a-rolling-average-in-r/
+
+# To calculate a simple moving average (over 7 days), we can use the rollmean() function from the zoo package. This function takes a k, which is an ’integer width of the rolling window. 
+
+library(zoo)
+# The code below calculates a 3, 5, and 7-day rolling average for the deathsfrom COVID in the US.
+COVID19_time <- COVID19_time %>%
+    dplyr::arrange(desc(Countyname)) %>% 
+    dplyr::group_by(Countyname) %>% 
+    dplyr::mutate(NewCases_03da = zoo::rollmean(NewCases, k = 3, fill = NA),
+                  NewCases_05da = zoo::rollmean(NewCases, k = 5, fill = NA),
+                  NewCases_07da = zoo::rollmean(NewCases, k = 7, fill = NA)) %>% 
+  dplyr::ungroup()
+
+# Below is an example of this calculation for the county of Los Angeles
+LA <- COVID19_time %>% 
+  dplyr::arrange(date) %>% 
+  dplyr::filter(Countyname == "Los Angeles") %>% 
+  dplyr::select(Countyname,
+                date,
+                NewCases,
+                NewCases_03da:NewCases_07da) %>% 
+  utils::tail(7)
+
+LA
+```
+
+```{r}
+# Behind the scene, each rolling mean is calculated from the numbers surrounding it. More specifically, the last non-NA value in the new NewCases_05da variable (4302), on date 2021-02-05, is the average NewCases in Los Angeles of that date with two data points on either side of it (i.e. the date 2021-02-05 has 2021-02-03 and 2021-02-04 preceding it, and 2021-02-06 and 2021-02-07 following it). We can check our math below.
+
+round(mean(c(4621, 2892, 2863)))
+```
+
+```{r}
+# Also we want to get the rolling average of daily new death
+# First, we need to calculate New Death 
+COVID19_time <- COVID19_time %>%
+  dplyr::arrange(desc(Countyname)) %>% 
+  dplyr::group_by(Countyname) %>% 
+  # calculate 'new deaths' = todays deaths - yesterdays deaths
+  dplyr::mutate(NewDeaths = Deaths - dplyr::lag(x = Deaths, n = 1, order_by = date)) %>% 
+  dplyr::ungroup()
+
+SB <- COVID19_time %>% 
+  dplyr::arrange(date) %>% 
+  dplyr::filter(Countyname == "San Bernardino") %>% 
+  dplyr::select(Countyname,
+                date,
+                Deaths,
+                NewDeaths) %>% 
+  utils::tail(7)
+
+SB
+```
+
+```{r}
+# We can quickly do a simple check of the calculation
+2125-2080
+# Also we can check the head of the data (modify above cell)
+```
+
+```{r}
+# Set NewDeaths on first date = 0
+COVID19_time$NewDeaths[COVID19_time$date == firstDate] <- 0
+
+# Add rolling average for NewDeaths as well
+COVID19_time <- COVID19_time %>%
+    dplyr::arrange(desc(Countyname)) %>% 
+    dplyr::group_by(Countyname) %>% 
+    dplyr::mutate(NewDeaths_03da = zoo::rollmean(NewDeaths, k = 3, fill = NA),
+                  NewDeaths_05da = zoo::rollmean(NewDeaths, k = 5, fill = NA),
+                  NewDeaths_07da = zoo::rollmean(NewDeaths, k = 7, fill = NA)) %>% 
+  dplyr::ungroup()
+
+# Check data for San Bernardino again
+SB <- COVID19_time %>% 
+  dplyr::arrange(date) %>% 
+  dplyr::filter(Countyname == "San Bernardino") %>% 
+  dplyr::select(Countyname,
+                date,
+                Deaths,
+                NewDeaths,
+                NewDeaths_03da:NewDeaths_07da ) %>% 
+  utils::tail(7)
+
+SB
+```
+
+```{r}
+# The higher the value of k, the smoother the line gets, but we are also sacrificing more data.
+# We can remove the first and last three dates from the data to make sure no NA for 3,5,and 7-day average
+
+COVID19_time <- COVID19_time[(COVID19_time$date >= firstDate+3) & (COVID19_time$date <= lastDate-3),]
+range(COVID19_time$date)
+```
+
+```{r}
+#############################################
+# Write output feature class with arc.write #
+#############################################
+
+# Outer join of the two tables by county FIPS: add geometry to the time series data
+USCounties.sf <- arc.data2sf(USCounties)
+mergedData <- merge(x = USCounties.sf, y = COVID19_time, by = c("FIPS"), all = TRUE)
+
+# Use lubridate to convert date as datatime
+mergedData$date <- as.POSIXct(mergedData$date)
+
+# Write output features
+state_no_space <- gsub(" ","",state)
+out_fc <- paste0("DevSummit2021-RNotebook.gdb/covid_19_time_series_",state_no_space)
+arc.write(out_fc, mergedData, validate = TRUE, overwrite = TRUE)
+out_fc
+```
